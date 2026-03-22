@@ -2,6 +2,7 @@ import angr
 from angr import sim_options as o
 from angr.analyses.cdg import CDG, TemporaryNode
 from collections import deque
+from utils import build_slice_patch, apply_patches
 
 TARGET_BINARY = "examples/sample_001_indcall_mba"
 OUTPUT_BINARY = "examples/sample_001_mba_patched"
@@ -71,65 +72,6 @@ def slice_to_symbolic(proj, slice_cls, target_reg='rax'):
 
     return all_states[0].regs.get(target_reg)
 
-def build_slice_patch(proj, slice_cls, target_addr):
-    """
-    Compute the patch bytes for one slice: returns a dict {file_offset: bytes}.
-    Finds the first contiguous slice region >= 5 bytes, places 'call target' there,
-    and NOPs out everything else.
-    """
-    import keystone
-    ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-    CALL_SIZE = 5
-
-    seen = {}
-    for cl in slice_cls:
-        addr = cl.ins_addr
-        if addr is None or addr in seen:
-            continue
-        for insn in proj.factory.block(addr).capstone.insns:
-            if insn.address == addr:
-                seen[addr] = insn.size
-                break
-    insns = sorted(seen.items())
-
-    patch_start = patch_total = None
-    for i, (addr, size) in enumerate(insns):
-        run_size = size
-        for j in range(i + 1, len(insns)):
-            if insns[j-1][0] + insns[j-1][1] != insns[j][0]:
-                break
-            run_size += insns[j][1]
-            if run_size >= CALL_SIZE:
-                break
-        if run_size >= CALL_SIZE:
-            patch_start, patch_total = addr, run_size
-            break
-
-    if patch_start is None:
-        raise RuntimeError(f"No contiguous slice region >= {CALL_SIZE} bytes for call 0x{target_addr:x}")
-
-    call_bytes, _ = ks.asm(f"call 0x{target_addr:x}", addr=patch_start)
-    assert call_bytes is not None
-    file_base = proj.loader.main_object.min_addr
-    patches = {}
-    patches[patch_start - file_base] = bytes(call_bytes) + b'\x90' * (patch_total - len(call_bytes))
-    for addr, size in insns:
-        if patch_start <= addr < patch_start + patch_total:
-            continue
-        patches[addr - file_base] = b'\x90' * size
-
-    print(f"  -> call 0x{target_addr:x} at 0x{patch_start:x} (+{patch_total - CALL_SIZE} nops)")
-    return patches
-
-def apply_patches(patches_list, input_file, output_file):
-    """Write all accumulated patches to output_file in one pass."""
-    import shutil
-    shutil.copy(input_file, output_file)
-    with open(output_file, "r+b") as f:
-        for patches in patches_list:
-            for offset, data in patches.items():
-                f.seek(offset)
-                f.write(data)
 
 def backward_slice_from(proj, cfg, ddg, target_insn_addr):
     """Return all DDG nodes in the backward slice of the instruction at target_insn_addr."""
