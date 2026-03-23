@@ -3,7 +3,7 @@ import pyvex
 from angr import sim_options as o
 from angr.analyses.cdg import CDG, TemporaryNode
 from collections import deque
-from utils import *
+from utils import *  # includes apply_patches from patch_utils
 
 # from indcall import backward_slice_from
 
@@ -74,16 +74,6 @@ def backward_slice_from(proj, cfg, ddg, target_insn_addr):
             queue.append(pred)
     return slice_cls
 
-
-def apply_patches(patches_list, input_file, output_file):
-    """Write all accumulated patches to output_file in one pass."""
-    import shutil
-    shutil.copy(input_file, output_file)
-    with open(output_file, "r+b") as f:
-        for patches in patches_list:
-            for offset, data in patches.items():
-                f.seek(offset)
-                f.write(data)
 
 
 proj, main_func, cfg, ddg = load_everything(TARGET_BINARY, target_func_name=TARGET_FUNC_NAME, cfg_type="Emulated", auto_load_libs=False)

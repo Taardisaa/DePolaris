@@ -76,3 +76,120 @@ def analyze_branch_guard(
         return 'always_false', guard
     else:
         return 'symbolic', guard
+
+
+_prologue_state_cache: dict = {}
+
+
+def _get_prologue_state(proj: Project, func) -> 'claripy.ast.Base':
+    """Execute the function prologue once and cache the resulting state."""
+    import claripy as _claripy
+    RBP_CONCRETE = 0x7FFF_0000
+    key = (id(proj), func.addr)
+    if key in _prologue_state_cache:
+        return _prologue_state_cache[key]
+
+    state = proj.factory.blank_state(addr=func.addr)
+    state.regs.rsp = _claripy.BVV(RBP_CONCRETE + 8, 64)
+
+    simgr = proj.factory.simgr(state)
+    # Step through the prologue block (may be very large).
+    # Use num_inst=20 to split large blocks into manageable chunks.
+    prologue_end = func.addr + proj.factory.block(func.addr).size
+    for _ in range(50):
+        if not simgr.active:
+            break
+        if simgr.active[0].addr >= prologue_end:
+            break
+        simgr.step(num_inst=20)
+        if len(simgr.active) > 1:
+            simgr.active = simgr.active[:1]
+
+    if simgr.active:
+        _prologue_state_cache[key] = simgr.active[0]
+    return _prologue_state_cache.get(key)
+
+
+def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int) -> Optional[int]:
+    """
+    Symbolically execute from a cached post-prologue state up to the
+    use-site block and return the rbp-relative offset that rax will
+    hold after the getter chain's final deref.
+
+    Non-getter function calls (crc32_gentab, func_1, …) are skipped via
+    fast-return — the getter chain depends only on prologue-initialised
+    transit-node memory.
+    """
+    import claripy as _claripy
+    RBP_CONCRETE = 0x7FFF_0000
+    MAX_STEPS = 500
+
+    base_state = _get_prologue_state(proj, func)
+    if base_state is None:
+        return None
+
+    func_blocks = set(func.block_addrs)
+
+    # Identify getter functions once: single-block, ends with ret, ≤ 4 insns.
+    getter_addrs: set[int] = set()
+    for f in proj.kb.functions.values():
+        if f.addr in func_blocks:
+            continue
+        try:
+            blk = proj.factory.block(f.addr)
+            if blk.vex.jumpkind == 'Ijk_Ret' and blk.instructions <= 4:
+                getter_addrs.add(f.addr)
+        except Exception:
+            pass
+
+    state = base_state.copy()
+    simgr = proj.factory.simgr(state)
+
+    for _ in range(MAX_STEPS):
+        if not simgr.active:
+            break
+        # Check if any state reached the target
+        if any(s.addr == use_block_addr for s in simgr.active):
+            simgr.active = [s for s in simgr.active if s.addr == use_block_addr]
+            break
+
+        # Fast-return: skip non-getter external functions immediately.
+        for s in simgr.active:
+            if s.addr not in func_blocks and s.addr not in getter_addrs:
+                ret = s.memory.load(s.regs.rsp, 8, endness=proj.arch.memory_endness)
+                if not ret.symbolic:
+                    s.regs.rip = ret
+                    s.regs.rsp = s.regs.rsp + 8
+
+        prev_addrs = {s.addr for s in simgr.active}
+        simgr.step(num_inst=20)
+
+        # On branches, keep the state closest to (but not past) the target.
+        if len(simgr.active) > 1:
+            simgr.active = sorted(
+                simgr.active,
+                key=lambda s: (s.addr > use_block_addr, abs(s.addr - use_block_addr)),
+            )[:1]
+
+        # simgr can get stuck after branch pruning; recreate it if needed.
+        if simgr.active and {s.addr for s in simgr.active} == prev_addrs:
+            simgr = proj.factory.simgr(simgr.active[0].copy())
+    else:
+        return None
+
+    if not simgr.active:
+        return None
+
+    # At use_block_addr the last getter returned a slot pointer in rax.
+    # Read [rax] to simulate the use-site deref (which we NOP in the patch).
+    state = simgr.active[0]
+    rax = state.regs.rax
+    rbp = state.regs.rbp
+    if rax.symbolic or rbp.symbolic:
+        return None
+
+    derefed = state.memory.load(rax, 8, endness=proj.arch.memory_endness)
+    if derefed.symbolic:
+        return None
+
+    return derefed.concrete_value - rbp.concrete_value
