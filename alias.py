@@ -1,7 +1,7 @@
 import angr
 import pyvex
+import capstone.x86 as cx
 from angr.analyses.cdg import CDG, TemporaryNode
-from collections import deque
 from utils import *
 from utils.vex_utils import _extract_getter_offset, setup_getter_hooks
 
@@ -19,129 +19,54 @@ def _patched_pd_graph_successors(graph, node):
 CDG._pd_graph_successors = _patched_pd_graph_successors
 
 
-# ── VEX-based helpers (register-independent) ──
+# ── Structural helpers ──
 
-def _store_addr_has_load(irsb, store_stmt_idx) -> bool:
-    """True if the Store's address traces back to a memory Load (pointer deref).
-    Obfuscated stores use pointer-based addressing (Load + optional offset),
-    while direct stack stores use GET(rbp) + offset with no Load."""
-    store = irsb.statements[store_stmt_idx]
-    addr = store.addr
-    if not isinstance(addr, pyvex.expr.RdTmp):
-        return False
-    for s in irsb.statements:
-        if isinstance(s, pyvex.stmt.WrTmp) and s.tmp == addr.tmp:
-            if isinstance(s.data, pyvex.expr.Load):
-                return True
-            if isinstance(s.data, pyvex.expr.Binop) and 'Add' in s.data.op:
-                for arg in s.data.args:
-                    if isinstance(arg, pyvex.expr.RdTmp):
-                        for s2 in irsb.statements:
-                            if isinstance(s2, pyvex.stmt.WrTmp) and s2.tmp == arg.tmp:
-                                return isinstance(s2.data, pyvex.expr.Load)
-            return False
-    return False
-
-
-def _find_deref_addr(irsb, store_stmt_idx):
-    """Return the instruction address of the Load (deref) that feeds the Store's
-    address, or None.  Works regardless of which register is used."""
-    store = irsb.statements[store_stmt_idx]
-    addr = store.addr
-    if not isinstance(addr, pyvex.expr.RdTmp):
-        return None
-
-    load_tmp = None
-    for s in irsb.statements:
-        if isinstance(s, pyvex.stmt.WrTmp) and s.tmp == addr.tmp:
-            if isinstance(s.data, pyvex.expr.Load):
-                load_tmp = addr.tmp
-            elif isinstance(s.data, pyvex.expr.Binop) and 'Add' in s.data.op:
-                for arg in s.data.args:
-                    if isinstance(arg, pyvex.expr.RdTmp):
-                        for s2 in irsb.statements:
-                            if isinstance(s2, pyvex.stmt.WrTmp) and s2.tmp == arg.tmp:
-                                if isinstance(s2.data, pyvex.expr.Load):
-                                    load_tmp = arg.tmp
-                                break
-            break
-
-    if load_tmp is None:
-        return None
-
-    cur_imk = None
-    for s in irsb.statements:
-        if isinstance(s, pyvex.stmt.IMark):
-            cur_imk = s.addr
-        if isinstance(s, pyvex.stmt.WrTmp) and s.tmp == load_tmp:
-            return cur_imk
+def _find_self_deref_insn(block):
+    """Return the capstone insn of the first `mov REG, [REG]` (self-deref) in the
+    block, or None.  Register-independent and encoding-independent."""
+    for insn in block.capstone.insns:
+        if insn.mnemonic != 'mov' or len(insn.operands) != 2:
+            continue
+        dst, src = insn.operands
+        if (dst.type == cx.X86_OP_REG and src.type == cx.X86_OP_MEM
+                and src.mem.base == dst.reg
+                and src.mem.index == 0 and src.mem.disp == 0):
+            return insn
     return None
 
 
-# ── Store discovery ──
+def find_obfuscated_blocks(proj, func, getter_addrs):
+    """
+    Yield (use_block_addr, pred_block_addr, deref_insn) for every block that
+    contains an obfuscated data access (read or store).
 
-def find_store_sites(proj, func):
-    """
-    Yield (block_addr, store_stmt_idx, store_insn_addr) for every real VEX Store
-    in the function.  VEX lifts `call` as a return-address push (STle) — these
-    are skipped.  store_insn_addr is the assembly instruction that owns the Store
-    (derived from the nearest preceding IMark).
-    """
-    for block_addr in func.block_addrs:
-        irsb = proj.factory.block(block_addr).vex
-        block_insns = {i.address: i for i in proj.factory.block(block_addr).capstone.insns}
-        current_insn_addr = None
-        for i, s in enumerate(irsb.statements):
-            if isinstance(s, pyvex.stmt.IMark):
-                current_insn_addr = s.addr
-            elif isinstance(s, pyvex.stmt.Store):
-                asm = block_insns.get(current_insn_addr)
-                if asm and asm.mnemonic == 'call':
-                    continue
-                yield (block_addr, i, current_insn_addr)
+    Detection is purely structural:
+      1. The block's predecessor ends with Ijk_Call to a getter function.
+      2. The block itself contains a self-deref (`mov REG, [REG]`).
 
-
-def backward_slice_from_store(proj, cfg, ddg, block_addr, store_stmt_idx):
+    Intermediate getter hops (which do `mov [REG], RDI` for the next call)
+    are excluded because they don't have a self-deref.
     """
-    Return all DDG nodes in the backward slice of a Store statement.
-    Seeds from the Store's stmt_idx; falls back to the two preceding stmt indices
-    (the WrTmp nodes computing the address) if no DDG node exists at the Store itself.
-    """
-    candidates = [store_stmt_idx, store_stmt_idx - 1, store_stmt_idx - 2]
-    seed_nodes = []
-    for idx in candidates:
-        seed_nodes = [
-            n for n in ddg.graph.nodes()
-            if getattr(n, 'block_addr', None) == block_addr
-            and getattr(n, 'stmt_idx', None) == idx
-        ]
-        if seed_nodes:
+    func_blocks = set(func.block_addrs)
+    for ba in sorted(func_blocks):
+        for pred_ba in func_blocks:
+            if pred_ba == ba:
+                continue
+            pred_blk = proj.factory.block(pred_ba)
+            if pred_blk.vex.jumpkind != 'Ijk_Call':
+                continue
+            if pred_ba + pred_blk.size != ba:
+                continue
+            callee = pred_blk.vex.next
+            if not isinstance(callee, pyvex.expr.Const):
+                continue
+            if callee.con.value not in getter_addrs:
+                continue
+            # Predecessor is a getter call → check for self-deref
+            deref_insn = _find_self_deref_insn(proj.factory.block(ba))
+            if deref_insn is not None:
+                yield (ba, pred_ba, deref_insn)
             break
-
-    if not seed_nodes:
-        return set()
-
-    visited = set()
-    queue = deque(seed_nodes)
-    slice_cls = set()
-    while queue:
-        cl = queue.popleft()
-        if cl in visited:
-            continue
-        visited.add(cl)
-        slice_cls.add(cl)
-        for pred in ddg.graph.predecessors(cl):
-            queue.append(pred)
-    return slice_cls
-
-
-def is_alias_obfuscated(slice_cls, func, getter_addrs):
-    """True if the backward slice includes blocks from getter functions."""
-    return any(
-        getattr(n, 'block_addr', None) in getter_addrs
-        for n in slice_cls
-        if getattr(n, 'block_addr', None) is not None
-    )
 
 
 # ── Main ──
@@ -166,74 +91,25 @@ for f in proj.kb.functions.values():
 
 setup_getter_hooks(proj, main_func)
 
-# ── Phase 1: resolve rbp-relative offsets for all obfuscated use-sites ──
-resolved: dict[int, int] = {}
-seen_stores: set[int] = set()
+# ── Phase 1: find all obfuscated access blocks and resolve addresses ──
+resolved: dict[int, tuple[int, int, object]] = {}  # use_block → (rbp_rel, pred_block, deref_insn)
 
-for block_addr, store_idx, store_insn_addr in find_store_sites(proj, main_func):
-    if store_insn_addr is None or store_insn_addr in seen_stores:
-        continue
-    seen_stores.add(store_insn_addr)
-
-    # VEX-based structural check: an obfuscated store's address traces back to
-    # a memory Load (pointer deref), not a direct GET(rbp)+offset.
-    irsb = proj.factory.block(block_addr).vex
-    if not _store_addr_has_load(irsb, store_idx):
-        continue
-
-    slice_cls = backward_slice_from_store(proj, cfg, ddg, block_addr, store_idx)
-    if not slice_cls or not is_alias_obfuscated(slice_cls, main_func, getter_addrs):
-        continue
-
-    rbp_rel = resolve_alias_chain(proj, slice_cls, main_func, block_addr)
+for use_block, pred_block, deref_insn in find_obfuscated_blocks(proj, main_func, getter_addrs):
+    rbp_rel = resolve_alias_chain(proj, set(), main_func, use_block)
     if rbp_rel is None:
-        print(f"  [skip] could not resolve chain at 0x{store_insn_addr:x}")
+        print(f"  [skip] could not resolve chain for block 0x{use_block:x}")
         continue
 
-    resolved[block_addr] = rbp_rel
-    print(f"  0x{store_insn_addr:x} -> rbp + {rbp_rel:#x}")
+    resolved[use_block] = (rbp_rel, pred_block, deref_insn)
+    print(f"  0x{use_block:x} -> rbp + {rbp_rel:#x}")
 
 # ── Phase 2: build patches ──
-# Strategy: for each resolved store, overwrite the LAST getter call (in the
-# preceding block) with a LEA, and NOP the deref (found via VEX) separately.
-# This avoids touching intermediate chain blocks shared with other stores.
+# For each resolved block, replace the LAST getter call (in the predecessor)
+# with a LEA, and NOP the deref separately.
 byte_map: dict[int, int] = {}
 
-for use_block, rbp_rel in resolved.items():
-    irsb = proj.factory.block(use_block).vex
-
-    # Find the preceding block: the one whose call returns to use_block.
-    pred_addr = None
-    for ba in func_blocks:
-        if ba == use_block:
-            continue
-        blk = proj.factory.block(ba)
-        if blk.vex.jumpkind == 'Ijk_Call' and ba + blk.size == use_block:
-            pred_addr = ba
-            break
-
-    # Find the deref via VEX: the Load that feeds the first Store's address.
-    deref_addr = None
-    for i, s in enumerate(irsb.statements):
-        if isinstance(s, pyvex.stmt.Store):
-            deref_addr = _find_deref_addr(irsb, i)
-            break
-
-    if pred_addr is None or deref_addr is None:
-        print(f"  [skip patch] no pred/deref for use_block 0x{use_block:x}")
-        continue
-
-    # Find the deref's capstone instruction (for its size).
-    deref_insn = None
-    for insn in proj.factory.block(use_block).capstone.insns:
-        if insn.address == deref_addr:
-            deref_insn = insn
-            break
-    if deref_insn is None:
-        continue
-
-    # The last instruction of the preceding block is the getter call.
-    call_insn = proj.factory.block(pred_addr).capstone.insns[-1]
+for use_block, (rbp_rel, pred_block, deref_insn) in resolved.items():
+    call_insn = proj.factory.block(pred_block).capstone.insns[-1]
 
     # Assemble the LEA
     lea_asm = f"lea rax, [rbp + ({rbp_rel})]"
@@ -258,4 +134,4 @@ if byte_map:
     apply_patches([merged], TARGET_BINARY, OUTPUT_BINARY)
     print(f"\nWrote {len(resolved)} patches -> {OUTPUT_BINARY}")
 else:
-    print("No alias-obfuscated stores found.")
+    print("No alias-obfuscated accesses found.")

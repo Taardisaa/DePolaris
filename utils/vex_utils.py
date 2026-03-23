@@ -172,6 +172,22 @@ def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int
     simgr.explore(find=use_block_addr, num_find=1)
 
     if not simgr.found:
+        # Blocks behind conditional branches may be unreachable with
+        # ZERO_FILL (branch condition depends on uninitialised struct fields).
+        # Retry from func entry WITHOUT ZERO_FILL — symbolic branches
+        # fork but the state count stays small with hooked non-getters.
+        import claripy as _claripy
+        from angr import sim_options as o
+        retry = proj.factory.blank_state(
+            addr=func.addr,
+            add_options={o.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
+                         o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS},
+        )
+        retry.regs.rsp = _claripy.BVV(RBP_CONCRETE + 8, 64)
+        simgr = proj.factory.simgr(retry)
+        simgr.explore(find=use_block_addr, num_find=1)
+
+    if not simgr.found:
         return None
 
     # At use_block_addr the last getter returned a slot pointer in rax.
