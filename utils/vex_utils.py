@@ -110,30 +110,45 @@ _prologue_state_cache: dict = {}
 def _get_prologue_state(proj: Project, func) -> 'claripy.ast.Base':
     """Execute the function prologue once and cache the resulting state."""
     import claripy as _claripy
+    from angr import sim_options as o
     RBP_CONCRETE = 0x7FFF_0000
     key = (id(proj), func.addr)
     if key in _prologue_state_cache:
         return _prologue_state_cache[key]
 
-    state = proj.factory.blank_state(addr=func.addr)
+    state = proj.factory.blank_state(
+        addr=func.addr,
+        add_options={o.ZERO_FILL_UNCONSTRAINED_MEMORY,
+                     o.ZERO_FILL_UNCONSTRAINED_REGISTERS},
+    )
     state.regs.rsp = _claripy.BVV(RBP_CONCRETE + 8, 64)
 
-    simgr = proj.factory.simgr(state)
-    # Step through the prologue block (may be very large).
-    # Use num_inst=20 to split large blocks into manageable chunks.
     prologue_end = func.addr + proj.factory.block(func.addr).size
-    for _ in range(50):
-        if not simgr.active:
-            break
-        if simgr.active[0].addr >= prologue_end:
-            break
-        simgr.step(num_inst=20)
-        if len(simgr.active) > 1:
-            simgr.active = simgr.active[:1]
+    simgr = proj.factory.simgr(state)
+    simgr.explore(find=lambda s: s.addr >= prologue_end)
 
-    if simgr.active:
-        _prologue_state_cache[key] = simgr.active[0]
+    if simgr.found:
+        _prologue_state_cache[key] = simgr.found[0]
     return _prologue_state_cache.get(key)
+
+
+def setup_getter_hooks(proj: Project, func) -> None:
+    """Hook all non-getter external functions so symex skips them."""
+    import angr as _angr
+    func_blocks = set(func.block_addrs)
+
+    class _SkipFunc(_angr.SimProcedure):
+        def run(self):
+            return 0
+
+    for f in proj.kb.functions.values():
+        if f.addr in func_blocks:
+            continue
+        if proj.is_hooked(f.addr):
+            continue
+        if _extract_getter_offset(proj, f.addr) is not None:
+            continue
+        proj.hook(f.addr, _SkipFunc())
 
 
 def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int) -> Optional[int]:
@@ -142,69 +157,26 @@ def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int
     use-site block and return the rbp-relative offset that rax will
     hold after the getter chain's final deref.
 
-    Non-getter function calls (crc32_gentab, func_1, …) are skipped via
-    fast-return — the getter chain depends only on prologue-initialised
-    transit-node memory.
+    Non-getter function calls are hooked (setup_getter_hooks) so symex
+    only traverses the getter chain.  ZERO_FILL options on the initial
+    state prevent path explosion by making all branches deterministic.
     """
-    import claripy as _claripy
     RBP_CONCRETE = 0x7FFF_0000
-    MAX_STEPS = 500
 
     base_state = _get_prologue_state(proj, func)
     if base_state is None:
         return None
 
-    func_blocks = set(func.block_addrs)
-
-    # Identify getter functions: must have the rdi+offset→rax pattern.
-    getter_addrs: set[int] = set()
-    for f in proj.kb.functions.values():
-        if f.addr in func_blocks:
-            continue
-        if _extract_getter_offset(proj, f.addr) is not None:
-            getter_addrs.add(f.addr)
-
     state = base_state.copy()
     simgr = proj.factory.simgr(state)
+    simgr.explore(find=use_block_addr, num_find=1)
 
-    for _ in range(MAX_STEPS):
-        if not simgr.active:
-            break
-        # Check if any state reached the target
-        if any(s.addr == use_block_addr for s in simgr.active):
-            simgr.active = [s for s in simgr.active if s.addr == use_block_addr]
-            break
-
-        # Fast-return: skip non-getter external functions immediately.
-        for s in simgr.active:
-            if s.addr not in func_blocks and s.addr not in getter_addrs:
-                ret = s.memory.load(s.regs.rsp, 8, endness=proj.arch.memory_endness)
-                if not ret.symbolic:
-                    s.regs.rip = ret
-                    s.regs.rsp = s.regs.rsp + 8
-
-        prev_addrs = {s.addr for s in simgr.active}
-        simgr.step(num_inst=20)
-
-        # On branches, keep the state closest to (but not past) the target.
-        if len(simgr.active) > 1:
-            simgr.active = sorted(
-                simgr.active,
-                key=lambda s: (s.addr > use_block_addr, abs(s.addr - use_block_addr)),
-            )[:1]
-
-        # simgr can get stuck after branch pruning; recreate it if needed.
-        if simgr.active and {s.addr for s in simgr.active} == prev_addrs:
-            simgr = proj.factory.simgr(simgr.active[0].copy())
-    else:
-        return None
-
-    if not simgr.active:
+    if not simgr.found:
         return None
 
     # At use_block_addr the last getter returned a slot pointer in rax.
     # Read [rax] to simulate the use-site deref (which we NOP in the patch).
-    state = simgr.active[0]
+    state = simgr.found[0]
     rax = state.regs.rax
     rbp = state.regs.rbp
     if rax.symbolic or rbp.symbolic:
