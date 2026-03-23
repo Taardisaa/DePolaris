@@ -129,9 +129,49 @@ for use_block, (rbp_rel, pred_block, deref_insn) in resolved.items():
 
     print(f"  -> lea rax, [rbp + {rbp_rel:#x}] at 0x{call_insn.address:x}")
 
+# ── Phase 3: NOP remaining dead getter calls ──
+# After all data-access endpoints are patched with LEAs, intermediate getter
+# hops (lea rdi,...; call getter; mov (%rax),%rdi) are dead code — their
+# results are always overwritten.  NOP each entire hop sequence.
+patched_calls = {call_addr for call_addr in byte_map}  # already patched in Phase 2
+
+for ba in sorted(func_blocks):
+    blk = proj.factory.block(ba)
+    if blk.vex.jumpkind != 'Ijk_Call':
+        continue
+    callee = blk.vex.next
+    if not isinstance(callee, pyvex.expr.Const):
+        continue
+    if callee.con.value not in getter_addrs:
+        continue
+    call_insn = blk.capstone.insns[-1]
+    if call_insn.address - file_base in patched_calls:
+        continue
+    # NOP only the call instruction itself (other instructions in the block
+    # may be live stores/reads interleaved with the dead getter chain).
+    for i in range(call_insn.size):
+        off = call_insn.address - file_base + i
+        if off not in byte_map:
+            byte_map[off] = 0x90
+
+    # Also NOP the result load in the successor block: mov (%rax),%rdi
+    succ_addr = ba + blk.size
+    try:
+        succ_insn = proj.factory.block(succ_addr).capstone.insns[0]
+        # Verify it's a load from [rax] (the getter result)
+        if (succ_insn.mnemonic == 'mov' and len(succ_insn.operands) == 2
+                and succ_insn.operands[1].type == cx.X86_OP_MEM
+                and succ_insn.operands[1].mem.disp == 0):
+            for i in range(succ_insn.size):
+                off = succ_insn.address - file_base + i
+                if off not in byte_map:
+                    byte_map[off] = 0x90
+    except Exception:
+        pass
+
 if byte_map:
     merged = {off: bytes([b]) for off, b in sorted(byte_map.items())}
     apply_patches([merged], TARGET_BINARY, OUTPUT_BINARY)
-    print(f"\nWrote {len(resolved)} patches -> {OUTPUT_BINARY}")
+    print(f"\nWrote {len(resolved)} access patches + dead-code cleanup -> {OUTPUT_BINARY}")
 else:
     print("No alias-obfuscated accesses found.")
