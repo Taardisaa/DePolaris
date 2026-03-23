@@ -1,25 +1,15 @@
 import angr
 import pyvex
 import capstone.x86 as cx
-from angr.analyses.cdg import CDG, TemporaryNode
-from utils import *
-from utils.vex_utils import _extract_getter_offset, setup_getter_hooks
+from utils.patch_utils import apply_patches
+from utils.vex_utils import _extract_getter_offset, resolve_alias_chain
 
 TARGET_BINARY = "examples/sample_001_alias"
 OUTPUT_BINARY = "examples/sample_001_alias_patched"
 TARGET_FUNC_NAME = "main"
 
 
-# Patch CDG: _entry defaults to project.entry which may not be in a starts=[main]-only CFG
-@staticmethod
-def _patched_pd_graph_successors(graph, node):
-    if node is None or type(node) is TemporaryNode:
-        return iter([])
-    return (s for s in graph.model.get_successors(node) if s is not None)
-CDG._pd_graph_successors = _patched_pd_graph_successors
-
-
-# ── Structural helpers ──
+# ── Helpers ──
 
 def _find_self_deref_insn(block):
     """Return the capstone insn of the first `mov REG, [REG]` (self-deref) in the
@@ -71,10 +61,13 @@ def find_obfuscated_blocks(proj, func, getter_addrs):
 
 # ── Main ──
 
-proj, main_func, cfg, ddg = load_everything(
-    TARGET_BINARY, target_func_name=TARGET_FUNC_NAME,
-    cfg_type="Emulated", auto_load_libs=False)
-assert proj is not None and main_func is not None and cfg is not None and ddg is not None
+# CFGFast is sufficient — chain-walk resolver doesn't need DDG or CFGEmulated.
+proj = angr.Project(TARGET_BINARY, auto_load_libs=False)
+proj.analyses.CFGFast(normalize=True)
+sym = proj.loader.find_symbol(TARGET_FUNC_NAME)
+assert sym is not None, f"Function '{TARGET_FUNC_NAME}' not found"
+main_func = proj.kb.functions[sym.rebased_addr]
+print(f"Found function '{TARGET_FUNC_NAME}' at address 0x{sym.rebased_addr:x}.")
 
 import keystone
 ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
@@ -89,7 +82,7 @@ for f in proj.kb.functions.values():
     if _extract_getter_offset(proj, f.addr) is not None:
         getter_addrs.add(f.addr)
 
-setup_getter_hooks(proj, main_func)
+# No function hooks needed — chain-walk resolver bypasses all non-chain code.
 
 # ── Phase 1: find all obfuscated access blocks and resolve addresses ──
 resolved: dict[int, tuple[int, int, object]] = {}  # use_block → (rbp_rel, pred_block, deref_insn)

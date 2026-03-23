@@ -151,15 +151,72 @@ def setup_getter_hooks(proj: Project, func) -> None:
         proj.hook(f.addr, _SkipFunc())
 
 
+def _symex_getter_offset(proj: Project, getter_addr: int) -> Optional[int]:
+    """Fallback: symex a single getter function to determine its offset.
+    Handles MBA-obfuscated getters where VEX pattern matching fails.
+    Only runs on single-block Ijk_Ret functions (getter candidates)."""
+    import claripy as _claripy
+    try:
+        # Pre-filter: only attempt on single-block ret functions
+        irsb = proj.factory.block(getter_addr).vex
+        if irsb.jumpkind != 'Ijk_Ret':
+            return None
+        rdi = _claripy.BVS("rdi", 64)
+        state = proj.factory.call_state(getter_addr, rdi)
+        simgr = proj.factory.simgr(state)
+        simgr.run()
+        if not simgr.deadended:
+            return None
+        s = simgr.deadended[0]
+        rax = s.regs.rax
+        if rax.symbolic:
+            offset = s.solver.eval(rax - rdi)
+            return offset
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_getter_offset(proj: Project, getter_addr: int) -> Optional[int]:
+    """Resolve a getter's constant offset: VEX pattern match first, symex fallback."""
+    off = _extract_getter_offset(proj, getter_addr)
+    if off is not None:
+        return off
+    return _symex_getter_offset(proj, getter_addr)
+
+
+def _find_getter_pred(proj: Project, block_addr: int, func_blocks: set, getter_resolver) -> Optional[dict]:
+    """Find the predecessor block that calls a getter and returns to block_addr.
+    Returns {'block_addr': pred_addr, 'callee': callee_addr, 'offset': K} or None."""
+    for ba in func_blocks:
+        if ba == block_addr:
+            continue
+        blk = proj.factory.block(ba)
+        if blk.vex.jumpkind != 'Ijk_Call':
+            continue
+        if ba + blk.size != block_addr:
+            continue
+        callee = blk.vex.next
+        if not isinstance(callee, pyvex.expr.Const):
+            continue
+        offset = getter_resolver(proj, callee.con.value)
+        if offset is not None:
+            return {'block_addr': ba, 'callee': callee.con.value, 'offset': offset}
+    return None
+
+
 def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int) -> Optional[int]:
     """
-    Symbolically execute from a cached post-prologue state up to the
-    use-site block and return the rbp-relative offset that rax will
-    hold after the getter chain's final deref.
+    Resolve the getter call chain for a use-site via chain-walk:
 
-    Non-getter function calls are hooked (setup_getter_hooks) so symex
-    only traverses the getter chain.  ZERO_FILL options on the initial
-    state prevent path explosion by making all branches deterministic.
+    1. Walk backward from use_block_addr through getter-call predecessors
+       (pure CFG structure, no branches traversed)
+    2. At the chain entry (first block whose predecessor is NOT a getter call),
+       single-block symex to get the concrete initial pointer value
+    3. Walk forward through prologue memory using getter offsets
+
+    No full-function symex, no SkipFunc hooks, no path explosion.
+    Per-getter symex fallback handles MBA-obfuscated getter offsets.
     """
     RBP_CONCRETE = 0x7FFF_0000
 
@@ -167,39 +224,107 @@ def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int
     if base_state is None:
         return None
 
+    func_blocks = set(func.block_addrs)
+
+    # Step 1: walk backward from use_block, collecting getter offsets.
+    # Import the deref checker from alias.py's scope — it's passed as a parameter
+    # or we detect it locally.
+    chain = []  # getter offsets in reverse order
+    current = use_block_addr
+    chain_entry = None
+
+    for depth in range(20):
+        pred = _find_getter_pred(proj, current, func_blocks, _resolve_getter_offset)
+        if pred is None:
+            break
+        chain.append(pred['offset'])
+        current = pred['block_addr']
+
+        # Chain boundary check 1: this block has a self-deref (mov REG,[REG]).
+        # That means it's a use-site for a DIFFERENT chain that also starts
+        # THIS chain — the interleaved block pattern.  Stop here.
+        import capstone.x86 as _cx
+        has_self_deref = False
+        for insn in proj.factory.block(current).capstone.insns:
+            if insn.mnemonic != 'mov' or len(insn.operands) != 2:
+                continue
+            dst, src = insn.operands
+            if (dst.type == _cx.X86_OP_REG and src.type == _cx.X86_OP_MEM
+                    and src.mem.base == dst.reg
+                    and src.mem.index == 0 and src.mem.disp == 0):
+                has_self_deref = True
+                break
+        if has_self_deref:
+            chain_entry = current
+            break
+
+        # Chain boundary check 2: predecessor is not a getter call →
+        # this is the first hop (prologue or standalone lea block).
+        own_pred = _find_getter_pred(proj, current, func_blocks, _resolve_getter_offset)
+        if own_pred is None:
+            chain_entry = current
+            break
+
+    if not chain or chain_entry is None:
+        return None
+    chain.reverse()
+
+    # Step 2: get the initial pointer value (rdi at the getter call).
+    import claripy as _claripy
+
+    if chain_entry == func.addr:
+        # Chain starts from the prologue block — the prologue state is already
+        # positioned at the getter entry with rdi set by the prologue's lea.
+        rdi = base_state.regs.rdi
+    else:
+        # Chain starts from a non-prologue block. Single-block symex using the
+        # prologue state's memory/registers to compute rdi concretely.
+        entry_state = base_state.copy()
+        entry_state.regs.rip = _claripy.BVV(chain_entry, 64)
+        succ = entry_state.step()
+        if not succ.flat_successors:
+            return None
+        rdi = succ.flat_successors[0].regs.rdi
+
+    if rdi.symbolic:
+        return None
+    initial_ptr = rdi.concrete_value
+
+    # Step 3: walk forward — apply first getter offset, then read memory for each hop
+    ptr = initial_ptr + chain[0]
+    for getter_offset in chain[1:]:
+        mem = base_state.memory.load(ptr, 8, endness=proj.arch.memory_endness)
+        if mem.symbolic:
+            return None
+        ptr = mem.concrete_value + getter_offset
+
+    # Final deref: read the slot pointer to get the raw struct address
+    mem = base_state.memory.load(ptr, 8, endness=proj.arch.memory_endness)
+    if mem.symbolic:
+        return None
+
+    return mem.concrete_value - RBP_CONCRETE
+
+
+# ── Legacy: full-function explore (kept as utility) ──
+
+def resolve_alias_chain_explore(proj: Project, func, use_block_addr: int) -> Optional[int]:
+    """Full-function simgr.explore resolver (legacy). Requires setup_getter_hooks."""
+    RBP_CONCRETE = 0x7FFF_0000
+    base_state = _get_prologue_state(proj, func)
+    if base_state is None:
+        return None
     state = base_state.copy()
     simgr = proj.factory.simgr(state)
     simgr.explore(find=use_block_addr, num_find=1)
-
-    if not simgr.found:
-        # Blocks behind conditional branches may be unreachable with
-        # ZERO_FILL (branch condition depends on uninitialised struct fields).
-        # Retry from func entry WITHOUT ZERO_FILL — symbolic branches
-        # fork but the state count stays small with hooked non-getters.
-        import claripy as _claripy
-        from angr import sim_options as o
-        retry = proj.factory.blank_state(
-            addr=func.addr,
-            add_options={o.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
-                         o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS},
-        )
-        retry.regs.rsp = _claripy.BVV(RBP_CONCRETE + 8, 64)
-        simgr = proj.factory.simgr(retry)
-        simgr.explore(find=use_block_addr, num_find=1)
-
     if not simgr.found:
         return None
-
-    # At use_block_addr the last getter returned a slot pointer in rax.
-    # Read [rax] to simulate the use-site deref (which we NOP in the patch).
     state = simgr.found[0]
     rax = state.regs.rax
     rbp = state.regs.rbp
     if rax.symbolic or rbp.symbolic:
         return None
-
     derefed = state.memory.load(rax, 8, endness=proj.arch.memory_endness)
     if derefed.symbolic:
         return None
-
     return derefed.concrete_value - rbp.concrete_value
