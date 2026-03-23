@@ -78,6 +78,32 @@ def analyze_branch_guard(
         return 'symbolic', guard
 
 
+def _extract_getter_offset(proj: Project, getter_addr: int) -> Optional[int]:
+    """
+    Return the constant offset K if the function at getter_addr is an
+    AliasAccess getter (rax = rdi + K; ret), otherwise None.
+    Checks the VEX IR for Add64(GET(rdi), Const) → PUT(rax) with Ijk_Ret.
+    """
+    try:
+        irsb = proj.factory.block(getter_addr).vex
+        if irsb.jumpkind != 'Ijk_Ret':
+            return None
+        rax_off = proj.arch.registers['rax'][0]
+        for s in irsb.statements:
+            if isinstance(s, pyvex.stmt.Put) and s.offset == rax_off:
+                if isinstance(s.data, pyvex.expr.RdTmp):
+                    tmp = s.data.tmp
+                    for s2 in irsb.statements:
+                        if isinstance(s2, pyvex.stmt.WrTmp) and s2.tmp == tmp:
+                            if isinstance(s2.data, pyvex.expr.Binop) and 'Add' in s2.data.op:
+                                for arg in s2.data.args:
+                                    if isinstance(arg, pyvex.expr.Const):
+                                        return arg.con.value
+    except Exception:
+        pass
+    return None
+
+
 _prologue_state_cache: dict = {}
 
 
@@ -130,17 +156,13 @@ def resolve_alias_chain(proj: Project, slice_cls: set, func, use_block_addr: int
 
     func_blocks = set(func.block_addrs)
 
-    # Identify getter functions once: single-block, ends with ret, ≤ 4 insns.
+    # Identify getter functions: must have the rdi+offset→rax pattern.
     getter_addrs: set[int] = set()
     for f in proj.kb.functions.values():
         if f.addr in func_blocks:
             continue
-        try:
-            blk = proj.factory.block(f.addr)
-            if blk.vex.jumpkind == 'Ijk_Ret' and blk.instructions <= 4:
-                getter_addrs.add(f.addr)
-        except Exception:
-            pass
+        if _extract_getter_offset(proj, f.addr) is not None:
+            getter_addrs.add(f.addr)
 
     state = base_state.copy()
     simgr = proj.factory.simgr(state)

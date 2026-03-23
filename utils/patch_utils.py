@@ -130,11 +130,11 @@ def build_lea_patch(
             continue
         if callee.con.value not in slice_ext_blocks:
             continue
-        # Only treat tiny single-block Ijk_Ret functions as getters.
+        # Only treat functions with the rdi+offset→rax getter pattern.
         # Regular functions (func_1, transparent_crc, …) also appear in the
         # slice via DDG edges but must not have their call sites NOPed.
-        callee_blk = proj.factory.block(callee.con.value)
-        if callee_blk.vex.jumpkind == 'Ijk_Ret' and callee_blk.instructions <= 4:
+        from utils.vex_utils import _extract_getter_offset
+        if _extract_getter_offset(proj, callee.con.value) is not None:
             chain_blocks.add(ba)
 
     # For chain blocks: NOP only the CALL instruction (last insn, 5 bytes).
